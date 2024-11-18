@@ -1,0 +1,525 @@
+/*
+ * This code is based on the original Autosteer_gps_teensy_v4.ino found at:
+ * https://github.com/AgHardware/Boards/blob/main/TeensyModules/AIO%20Standard%20v4/Firmware/Autosteer_gps_teensy_v4/Autosteer_gps_teensy_v4.ino
+ *
+ * This version has been modified to use the UM982 chip with dual triple-band antennas.
+ * The changes were made to improve roll information accuracy by reducing noise caused by cabin rocking.
+ * The UM982 provides dominant roll, heading, and location data, while the BNO085 serves as a backup during RTK signal loss.
+ *
+ * How to use:
+ * - Connect the Teensy 4.1 to the UM982 and other components as described in the connection plan.
+ * - Configure the UM982 as specified in the configuration section.
+ * - Adjust the user settings and variables as needed for your specific setup.
+ *
+ * Connection Plan:
+ * - Teensy Serial 7 TX (29) to UM982 RX1 (RTCM data for RTK)
+ * - Teensy Serial 7 RX (28) to UM982 TX1 (Position data)
+ * - BNO085 connected via I2C (SCL=19, SDA=18)
+ * - RTK radio connected to Serial3
+ *
+ * NMEA Messages Used from UM982:
+ * - GGA: Global Positioning System Fix Data
+ * - VTG: Course Over Ground and Ground Speed
+ * - GNHPR: Heading, Pitch, and Roll
+ * - RELPOSNED: Relative Positioning Information
+ *
+ * Differences from Original Code:
+ * - Removed all references to F9P.
+ * - Added support for UM982 chip with dual antennas.
+ * - Improved roll information accuracy by using UM982 for dominant roll, heading, and location data.
+ * - BNO085 used as a backup during RTK signal loss.
+ *
+ * Variables and Optimal Values:
+ * - baudAOG: Baud rate for AgIO USB connection (default: 115200)
+ * - baudGPS: Baud rate for GPS receiver (default: 460800)
+ * - baudRTK: Baud rate for RTK radio (default: 9600)
+ * - REPORT_INTERVAL: BNO report time (default: 20 ms)
+ * - baseLineLimit: Maximum CM difference in baseline (default: 5 cm)
+ * - headingcorr: Heading correction (default: 900 for 90 degrees)
+ * - invertRoll: Invert roll for IMU with dual antenna (default: true)
+ * - antennaDistance: Distance between the two antennas (default: 1 meter)
+ *
+ * Note: Adjust the variables based on your specific setup and requirements. Optimal values are provided as defaults.
+ *       Changing these values may affect the performance and accuracy of the system.
+ *       The bigger the distance between the antennas, the better the accuracy.
+ */
+
+#include <NativeEthernet.h>
+#include <NativeEthernetUdp.h>
+#include "zNMEAParser.h"
+#include "BNO08x_AOG.h"
+
+// Serial Ports
+#define SerialAOG Serial                // AgIO USB connection
+#define SerialRTK Serial3               // RTK radio
+HardwareSerial* SerialGPS = &Serial7;   // Main position receiver (GGA)
+
+const int32_t baudAOG = 115200;
+const int32_t baudGPS = 460800;
+const int32_t baudRTK = 9600;
+
+// Baudrates for detecting UBX receiver
+uint32_t baudrates[] = {4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600};
+const uint32_t nrBaudrates = sizeof(baudrates) / sizeof(baudrates);
+
+#define ImuWire Wire        // SCL=19:A5 SDA=18:A4
+#define RAD_TO_DEG_X_10 572.95779513082320876798154814105
+
+const bool invertRoll = true;  // Used for IMU with dual antenna
+#define baseLineLimit 5       // Max CM difference in baseline
+#define REPORT_INTERVAL 20    // BNO report time
+#define antennaDistance 1.0   // Distance between the two antennas in meters
+
+// Status LEDs
+#define GGAReceivedLED 13         // Teensy onboard LED
+#define Power_on_LED 5            // Red
+#define Ethernet_Active_LED 6     // Green
+#define GPSRED_LED 9              // Red (Flashing = NO IMU or Dual, ON = GPS fix with IMU)
+#define GPSGREEN_LED 10           // Green (Flashing = Dual bad, ON = Dual good)
+#define AUTOSTEER_STANDBY_LED 11  // Red
+#define AUTOSTEER_ACTIVE_LED 12   // Green
+
+uint32_t gpsReadyTime = 0;        // Used for GGA timeout
+
+// Ethernet Options (Teensy 4.1 Only)
+#ifdef ARDUINO_TEENSY41
+struct ConfigIP {
+    uint8_t ipOne = 192;
+    uint8_t ipTwo = 168;
+    uint8_t ipThree = 5;
+};
+ConfigIP networkAddress;
+
+byte Eth_myip = {0, 0, 0, 0}; // This is now set via AgIO
+byte mac[] = {0x00, 0x00, 0x56, 0x00, 0x00, 0x78};
+
+unsigned int portMy = 5120;             // Port of this module
+unsigned int AOGNtripPort = 2233;       // Port NTRIP data from AOG comes in
+unsigned int AOGAutoSteerPort = 8888;   // Port Autosteer data from AOG comes in
+unsigned int portDestination = 9999;    // Port of AOG that listens
+char Eth_NTRIP_packetBuffer;       // Buffer for receiving ntrip data
+
+EthernetUDP Eth_udpPAOGI;     // Out port 5544
+EthernetUDP Eth_udpNtrip;     // In port 2233
+EthernetUDP Eth_udpAutoSteer; // In & Out Port 8888
+
+IPAddress Eth_ipDestination;
+#endif // ARDUINO_TEENSY41
+
+byte CK_A = 0;
+byte CK_B = 0;
+int relposnedByteCount = 0;
+
+elapsedMillis speedPulseUpdateTimer = 0;
+byte velocityPWM_Pin = 36;      // Velocity (MPH speed) PWM pin
+
+bool useDual = false;
+bool dualReadyGGA = false;
+bool dualReadyRelPos = false;
+
+bool useCMPS = false;
+bool useBNO08x = false;
+
+#define CMPS14_ADDRESS 0x60
+
+const uint8_t bno08xAddresses[] = {0x4A, 0x4B};
+const int16_t nrBNO08xAdresses = sizeof(bno08xAddresses) / sizeof(bno08xAddresses);
+uint8_t bno08xAddress;
+BNO080 bno08x;
+
+double headingcorr = 900;  // 90deg heading correction (90deg*10)
+double baseline = 0;
+double rollDual = 0;
+double relPosD = 0;
+double heading = 0;
+
+byte ackPacket = {0xB5, 0x62, 0x01, 0x3C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+constexpr int serial_buffer_size = 512;
+uint8_t GPSrxbuffer[serial_buffer_size];    // Extra serial rx buffer
+uint8_t GPStxbuffer[serial_buffer_size];    // Extra serial tx buffer
+uint8_t RTKrxbuffer[serial_buffer_size];    // Extra serial rx buffer
+
+NMEAParser<3> parser;
+
+bool isTriggered = false;
+bool blink = false;
+
+bool Autosteer_running = true; // Auto set off in autosteer setup
+bool Ethernet_running = false; // Auto set on in ethernet setup
+bool GGA_Available = false;    // Do we have GGA on correct port?
+uint32_t PortSwapTime = 0;
+
+float roll = 0;
+float pitch = 0;
+float yaw = 0;
+
+double rollDelta;
+double rollDeltaSmooth;
+double correctionHeading;
+double gyroDelta;
+double imuGPS_Offset;
+double gpsHeading;
+double imuCorrected;
+#define twoPI 6.28318530717958647692
+#define PIBy2 1.57079632679489661923
+
+uint8_t aogSerialCmd = {'!', 'A', 'O', 'G'};
+uint8_t aogSerialCmdBuffer;
+uint8_t aogSerialCmdCounter = 0;
+
+bool passThroughGPS = false;
+
+struct ubxPacket {
+    uint8_t cls;
+    uint8_t id;
+    uint16_t len;
+    uint16_t counter;
+    uint16_t startingSpot;
+    uint8_t *payload;
+    uint8_t checksumA;
+    uint8_t checksumB;
+};
+
+void setup() {
+    delay(500);
+    pinMode(GGAReceivedLED, OUTPUT);
+    pinMode(Power_on_LED, OUTPUT);
+    pinMode(Ethernet_Active_LED, OUTPUT);
+    pinMode(GPSRED_LED, OUTPUT);
+    pinMode(GPSGREEN_LED, OUTPUT);
+    pinMode(AUTOSTEER_STANDBY_LED, OUTPUT);
+    pinMode(AUTOSTEER_ACTIVE_LED, OUTPUT);
+
+    parser.setErrorHandler(errorHandler);
+    parser.addHandler("G-GGA", GGA_Handler);
+    parser.addHandler("G-VTG", VTG_Handler);
+    parser.addHandler("GNHPR", GNHPR_Handler);
+
+    delay(10);
+    Serial.begin(baudAOG);
+    delay(10);
+    Serial.println("Start setup");
+
+    SerialGPS->begin(baudGPS);
+    SerialGPS->addMemoryForRead(GPSrxbuffer, serial_buffer_size);
+    SerialGPS->addMemoryForWrite(GPStxbuffer, serial_buffer_size);
+
+    delay(10);
+    SerialRTK.begin(baudRTK);
+    SerialRTK.addMemoryForRead(RTKrxbuffer, serial_buffer_size);
+
+    Serial.println("SerialAOG, SerialRTK, SerialGPS initialized");
+
+    Serial.println("\r\nStarting AutoSteer...");
+    autosteerSetup();
+  
+    Serial.println("\r\nStarting Ethernet...");
+    EthernetStart();
+
+    Serial.println("\r\nStarting IMU...");
+    uint8_t error;
+
+    ImuWire.begin();
+    ImuWire.beginTransmission(CMPS14_ADDRESS);
+    error = ImuWire.endTransmission();
+
+    if (error == 0) {
+        Serial.print("CMPS14 ADDRESS: 0x");
+        Serial.println(CMPS14_ADDRESS, HEX);
+        Serial.println("CMPS14 Ok.");
+        useCMPS = true;
+    } else {
+        Serial.println("CMPS not Connected or Found");
+    }
+
+    if (!useCMPS) {
+        for (int16_t i = 0; i < nrBNO08xAdresses; i++) {
+            bno08xAddress = bno08xAddresses[i];
+            ImuWire.beginTransmission(bno08xAddress);
+            error = ImuWire.endTransmission();
+
+            if (error == 0) {
+                Serial.print("0x");
+                Serial.print(bno08xAddress, HEX);
+                Serial.println(" BNO08X Ok.");
+
+                if (bno08x.begin(bno08xAddress, ImuWire)) {
+                    ImuWire.setClock(400000);
+                    delay(300);
+                    bno08x.enableGameRotationVector(REPORT_INTERVAL);
+                    useBNO08x = true;
+                } else {
+                    Serial.println("BNO080 not detected at given I2C address.");
+                }
+            } else {
+                Serial.print("0x");
+                Serial.print(bno08xAddress, HEX);
+                Serial.println(" BNO08X not Connected or Found");
+            }
+            if (useBNO08x) break;
+        }
+    }
+
+    delay(100);
+    Serial.print("\r\nuseCMPS = ");
+    Serial.println(useCMPS);
+    Serial.print("useBNO08x = ");
+    Serial.println(useBNO08x);
+
+    Serial.println("\r\nEnd setup, waiting for GPS...\r\n");
+}
+
+void loop() {
+    if (GGA_Available == false && !passThroughGPS) {
+        if (systick_millis_count - PortSwapTime >= 10000) {
+            Serial.println("Swapping GPS ports...\r\n");
+            HardwareSerial* SerialGPSTmp = SerialGPS;
+            SerialGPS = SerialGPS2;
+            SerialGPS2 = SerialGPSTmp;
+            PortSwapTime = systick_millis_count;
+        }
+    }
+
+    if (SerialAOG.available()) {
+        uint8_t incoming_char = SerialAOG.read();
+
+        if (aogSerialCmdCounter < 4 && aogSerialCmd[aogSerialCmdCounter] == incoming_char) {
+            aogSerialCmdBuffer[aogSerialCmdCounter] = incoming_char;
+            aogSerialCmdCounter++;
+        } else if (aogSerialCmdCounter == 4) {
+            aogSerialCmdBuffer[aogSerialCmdCounter] = incoming_char;
+            aogSerialCmdBuffer[aogSerialCmdCounter + 1] = SerialAOG.read();
+
+            if (aogSerialCmdBuffer[aogSerialCmdCounter] == 'R') {
+                HardwareSerial* autoBaudSerial = NULL;
+                SerialGPS = &Serial7;
+
+                if (aogSerialCmdBuffer[aogSerialCmdCounter + 1] == '1') {
+                    passThroughGPS = true;
+                    autoBaudSerial = SerialGPS;
+                }
+
+                const uint8_t UBX_SYNCH_1 = 0xB5;
+                const uint8_t UBX_SYNCH_2 = 0x62;
+                const uint8_t UBX_CLASS_ACK = 0x05;
+                const uint8_t UBX_CLASS_CFG = 0x06;
+                const uint8_t UBX_CFG_RATE = 0x08;
+
+                ubxPacket packetCfg{};
+                packetCfg.cls = UBX_CLASS_CFG;
+                packetCfg.id = UBX_CFG_RATE;
+                packetCfg.len = 0;
+                packetCfg.startingSpot = 0;
+
+                calcChecksum(&packetCfg);
+
+                byte mon_rate[] = {0xB5, 0x62, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+                mon_rate = packetCfg.cls;
+                mon_rate = packetCfg.id;
+                mon_rate = packetCfg.len & 0xFF;
+                mon_rate = packetCfg.len >> 8;
+                mon_rate = packetCfg.checksumA;
+                mon_rate = packetCfg.checksumB;
+
+                bool communicationSuccessfull = false;
+                uint32_t baudrate = 0;
+
+                for (uint32_t i = 0; i < nrBaudrates; i++) {
+                    baudrate = baudrates[i];
+                    Serial.print(F("Checking baudrate: "));
+                    Serial.println(baudrate);
+
+                    autoBaudSerial->begin(baudrate);
+                    delay(100);
+                    autoBaudSerial->write(0xFF);
+
+                    while (autoBaudSerial->available() > 0) {
+                        autoBaudSerial->read();
+                    }
+
+                    autoBaudSerial->write(mon_rate, 8);
+
+                    uint32_t millis_read = systick_millis_count;
+                    constexpr uint32_t UART_TIMEOUT = 1000;
+                    int ubxFrameCounter = 0;
+                    bool isUbx = false;
+                    uint8_t incoming = 0;
+
+                    uint8_t requestedClass = packetCfg.cls;
+                    uint8_t requestedID = packetCfg.id;
+
+                    uint8_t packetBufCls = 0;
+                    uint8_t packetBufId = 0;
+
+                    do {
+                        while (autoBaudSerial->available() > 0) {
+                            incoming = autoBaudSerial->read();
+
+                            if (!isUbx && incoming == UBX_SYNCH_1) {
+                                ubxFrameCounter = 0;
+                                isUbx = true;
+                            }
+
+                            if (isUbx) {
+                                if ((ubxFrameCounter == 0) && (incoming != UBX_SYNCH_1)) {
+                                    isUbx = false;
+                                } else if ((ubxFrameCounter == 1) && (incoming != UBX_SYNCH_2)) {
+                                    isUbx = false;
+                                } else if (ubxFrameCounter == 1 && incoming == UBX_SYNCH_2) {
+                                } else if (ubxFrameCounter == 2) {
+                                    packetBufCls = incoming;
+                                } else if (ubxFrameCounter == 3) {
+                                    packetBufId = incoming;
+
+                                    if (packetBufCls != UBX_CLASS_ACK) {
+                                        if ((packetBufCls == requestedClass) && (packetBufId == requestedID)) {
+                                            communicationSuccessfull = true;
+                                        } else {
+                                            isUbx = false;
+                                        }
+                                    }
+                                }
+                            }
+                            ubxFrameCounter++;
+                        }
+                    } while (systick_millis_count - millis_read < UART_TIMEOUT);
+
+                    if (communicationSuccessfull) {
+                        break;
+                    }
+                }
+
+                if (communicationSuccessfull) {
+                    SerialAOG.write(aogSerialCmdBuffer, 6);
+                    SerialAOG.print(F("Found receiver at baudrate: "));
+                    SerialAOG.println(baudrate);
+                    SerialAOG.println("!AOGOK");
+                } else {
+                    SerialAOG.println(F("u-blox GNSS not detected. Please check wiring."));
+                }
+
+                aogSerialCmdCounter = 0;
+            } else if (aogSerialCmdBuffer[aogSerialCmdCounter] == 'E' && aogSerialCmdBuffer[aogSerialCmdCounter + 1] == 'D') {
+                passThroughGPS = false;
+                aogSerialCmdCounter = 0;
+            }
+        } else {
+            aogSerialCmdCounter = 0;
+        }
+
+        if (passThroughGPS) {
+            SerialGPS->write(incoming_char);
+        } else {
+            SerialGPS->write(incoming_char);
+        }
+    }
+
+    if (SerialGPS->available()) {
+        if (passThroughGPS) {
+            SerialAOG.write(SerialGPS->read());
+        } else {
+            parser << SerialGPS->read();
+        }
+    }
+
+    udpNtrip();
+
+    if (SerialRTK.available()) {
+        SerialGPS->write(SerialRTK.read());
+    }
+
+    if (dualReadyGGA == true && dualReadyRelPos == true) {
+        BuildNmea();
+        dualReadyGGA = false;
+        dualReadyRelPos = false;
+    }
+
+    if (SerialGPS->available()) {
+        uint8_t incoming_char = SerialGPS->read();
+
+        if (passThroughGPS) {
+            SerialAOG.write(incoming_char);
+        } else {
+            // Just increase the byte counter for the first 3 bytes
+            if (relposnedByteCount < 4 && incoming_char == ackPacket[relposnedByteCount]) {
+                relposnedByteCount++;
+            } else if (relposnedByteCount > 3) {
+                // Real data, put the received bytes in the buffer
+                ackPacket[relposnedByteCount] = incoming_char;
+                relposnedByteCount++;
+            } else {
+                // Reset the counter, because the start sequence was broken
+                relposnedByteCount = 0;
+            }
+        }
+    }
+
+    // Check the message when the buffer is full
+    if (relposnedByteCount > 71) {
+        if (calcChecksum()) {
+            digitalWrite(GPSRED_LED, LOW);   // Turn red GPS LED OFF (we are now in dual mode so green LED)
+            useDual = true;
+            relPosDecode();
+        }
+        relposnedByteCount = 0;
+    }
+
+    // GGA timeout, turn off GPS LEDs etc.
+    if ((systick_millis_count - gpsReadyTime) > 10000) { // GGA age over 10 sec
+        digitalWrite(GPSRED_LED, LOW);
+        digitalWrite(GPSGREEN_LED, LOW);
+        useDual = false;
+    }
+
+    // Read BNO
+    if ((systick_millis_count - READ_BNO_TIME) > REPORT_INTERVAL && useBNO08x) {
+        READ_BNO_TIME = systick_millis_count;
+        readBNO();
+    }
+
+    if (Autosteer_running) {
+        autosteerLoop();
+    } else {
+        ReceiveUdp();
+    }
+
+    if (Ethernet.linkStatus() == LinkOFF) {
+        digitalWrite(Power_on_LED, 1);
+        digitalWrite(Ethernet_Active_LED, 0);
+    }
+    if (Ethernet.linkStatus() == LinkON) {
+        digitalWrite(Power_on_LED, 0);
+        digitalWrite(Ethernet_Active_LED, 1);
+    }
+}
+
+bool calcChecksum() {
+    CK_A = 0;
+    CK_B = 0;
+
+    for (int i = 2; i < 70; i++) {
+        CK_A = CK_A + ackPacket[i];
+        CK_B = CK_B + CK_A;
+    }
+
+    return (CK_A == ackPacket && CK_B == ackPacket);
+}
+
+// Given a message, calc and store the two byte "8-Bit Fletcher" checksum over the entirety of the message
+// This is called before we send a command message
+void calcChecksum(ubxPacket *msg) {
+    msg->checksumA = 0;
+    msg->checksumB = 0;
+
+    msg->checksumA += msg->cls;
+    msg->checksumB += msg->checksumA;
+
+    msg->checksumA += msg->id;
+    msg->checksumB += msg->checksumA;
+
+    msg->checksumA += (msg->len & 0xFF);
+    msg->checksumB += msg->checksumA;
+
+    msg->checksumA += (msg->len >> 8);
+   
