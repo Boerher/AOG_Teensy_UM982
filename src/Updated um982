@@ -1,0 +1,302 @@
+#include "zNMEAParser.h" // Library for parsing NMEA messages
+#include <Kalman.h> // Kalman filter library for smoothing values
+#include "BNO08x_AOG.h" // BNO085 IMU library
+#include <Ethernet.h> // Ethernet library for network communication
+#include <EthernetUdp.h> // UDP library for AgOpenGPS integration
+
+// --- User Configuration ---
+bool udpPassthrough = false; // Enable raw GPS data passthrough via UDP
+bool makeOGI = false;        // Generate PAOGI messages; false uses PANDA
+bool baseLineCheck = false;  // Enable IMU fusion if using dual antenna
+const bool invertRoll = true; // Invert roll for specific IMU setups
+#define baseLineLimit 5       // Baseline max deviation in cm
+double headingcorr = 0;       // Correct heading offset (e.g., magnetic declination)
+bool filterRoll = true;       // Enable Kalman filtering for roll
+float rollMEA = 0.5;          // Measurement uncertainty for roll
+float rollEST = 0.5;          // Estimation uncertainty for roll
+float rollQ = 0.005;          // Process variance for roll
+bool filterHeading = true;    // Enable Kalman filtering for heading
+float headingMEA = 0.5;       // Measurement uncertainty for heading
+float headingEST = 0.5;       // Estimation uncertainty for heading
+float headingQ = 0.005;       // Process variance for heading
+
+// --- Serial Ports ---
+#define SerialAOG Serial      // USB connection to AgIO
+#define SerialRTK Serial3     // RTK radio
+HardwareSerial* SerialGPS = &Serial7; // Main GPS receiver
+const int32_t baudAOG = 115200;       // USB connection speed
+const int32_t baudGPS = 460800;       // UM982 connection speed
+const int32_t baudRTK = 9600;         // RTK radio connection speed
+
+// --- Network Configuration ---
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED }; // MAC address
+IPAddress ip(192, 168, 1, 50);                      // Device IP address
+IPAddress agioIP(192, 168, 1, 100);                 // AgOpenGPS IP address
+unsigned int agioPort = 9999;                       // AgOpenGPS listening port
+EthernetUDP udp;
+
+// --- GPS State Variables ---
+bool dualReadyGGA = false; // Flag for valid GGA messages
+bool dualReadyRelPos = false; // Flag for valid relative position messages
+float roll = 0.0;          // Roll value
+float heading = 0.0;       // Heading value
+float pitch = 0.0;         // Pitch value
+double baseline = 0.0;     // Baseline length
+
+// --- LED Indicators ---
+#define GGAReceivedLED 13
+#define Power_on_LED 5
+#define Ethernet_Active_LED 6
+#define GPSRED_LED 9
+#define GPSGREEN_LED 10
+#define AUTOSTEER_STANDBY_LED 11
+#define AUTOSTEER_ACTIVE_LED 12
+uint32_t gpsReadyTime = 0; // Used for GGA timeout
+
+// --- Function Prototypes ---
+void parseNMEA();
+void sendToAgOpenGPS();
+void initializeEthernet();
+void initializeLEDs();
+void calculateBaseline();
+void applyFilters();
+void setup();
+void loop();
+void errorHandler();
+void GGA_Handler();
+void VTG_Handler();
+void HPR_Handler();
+void autosteerSetup();
+void EthernetStart();
+void udpNtrip();
+void BuildNmea();
+void relPosDecode();
+void readBNO();
+void autosteerLoop();
+void ReceiveUdp();
+void updateKalmanFilterSettings();
+void checkRTKStatus();
+void handleSensorFallback();
+void useBNO085ForAllData();
+void useUM982ForAllData();
+
+// --- Setup Function ---
+void setup() {
+    delay(500); // Allow time for serial monitors
+
+    // Initialize serial ports
+    SerialAOG.begin(baudAOG); // USB connection to AgIO
+    SerialGPS->begin(baudGPS);
+    SerialGPS->addMemoryForRead(GPSrxbuffer, serial_buffer_size);
+    SerialGPS->addMemoryForWrite(GPStxbuffer, serial_buffer_size);
+    SerialRTK.begin(baudRTK);
+    SerialRTK.addMemoryForRead(RTKrxbuffer, serial_buffer_size);
+
+    // Initialize Ethernet
+    initializeEthernet();
+
+    // Initialize LEDs
+    initializeLEDs();
+
+    // Confirm setup complete
+    SerialAOG.println("Setup complete, waiting for GPS data...");
+}
+
+// --- Main Loop ---
+void loop() {
+    // Parse incoming NMEA data
+    parseNMEA();
+
+    // Apply Kalman filtering to smooth roll and heading
+    applyFilters();
+
+    // Send data to AgOpenGPS
+    sendToAgOpenGPS();
+
+    // Update Kalman filter settings based on new data
+    updateKalmanFilterSettings();
+
+    // Check RTK status and handle sensor fallback
+    checkRTKStatus();
+    handleSensorFallback();
+}
+
+// --- Parse NMEA Data ---
+void parseNMEA() {
+    while (SerialGPS->available()) {
+        char incomingByte = SerialGPS->read();
+        parser << incomingByte; // Feed data into the parser
+
+        if (parser.isValid()) {
+            String messageType = parser.messageType();
+            if (messageType == "GGA") {
+                dualReadyGGA = true; // Handle GGA message
+            } else if (messageType == "HDT") {
+                heading = parser.getHeading();
+                dualReadyRelPos = true;
+            } else if (messageType == "VTG") {
+                // Handle VTG message if needed
+            } else if (messageType == "HPR") {
+                heading = parser.getHeading();
+                pitch = parser.getPitch();
+                roll = parser.getRoll();
+                dualReadyRelPos = true;
+            }
+        }
+    }
+}
+
+// --- Apply Filters ---
+void applyFilters() {
+    if (filterRoll) {
+        roll = rollFilter.updateEstimate(roll);
+    }
+    if (filterHeading) {
+        heading = headingFilter.updateEstimate(heading + headingCorrection);
+    }
+}
+
+// --- Send Data to AgOpenGPS ---
+void sendToAgOpenGPS() {
+    if (dualReadyGGA && dualReadyRelPos) {
+        String message = "$PAOGI,"; // Replace with PANDA if needed
+        message += String(roll, 2) + ",";
+        message += String(pitch, 2) + ",";
+        message += String(heading, 2) + "\r\n";
+
+        udp.beginPacket(agioIP, agioPort);
+        udp.write(message.c_str());
+        udp.endPacket();
+
+        dualReadyGGA = false;
+        dualReadyRelPos = false;
+    }
+}
+
+// --- Initialize Ethernet ---
+void initializeEthernet() {
+    Ethernet.begin(mac, ip);
+    udp.begin(5544); // UDP port for PAOGI messages
+    SerialAOG.println("Ethernet initialized");
+}
+
+// --- Initialize LEDs ---
+void initializeLEDs() {
+    pinMode(GGAReceivedLED, OUTPUT);
+    pinMode(Power_on_LED, OUTPUT);
+    pinMode(Ethernet_Active_LED, OUTPUT);
+    pinMode(GPSRED_LED, OUTPUT);
+    pinMode(GPSGREEN_LED, OUTPUT);
+    pinMode(AUTOSTEER_STANDBY_LED, OUTPUT);
+    pinMode(AUTOSTEER_ACTIVE_LED, OUTPUT);
+    digitalWrite(Power_on_LED, HIGH); // Indicate power is on
+}
+
+// --- Error Handler ---
+void errorHandler() {
+    // Handle errors
+}
+
+// --- GGA Handler ---
+void GGA_Handler() {
+    // Handle GGA messages
+}
+
+// --- VTG Handler ---
+void VTG_Handler() {
+    // Handle VTG messages
+}
+
+// --- HPR Handler ---
+void HPR_Handler() {
+    // Handle HPR messages
+}
+
+// --- Autosteer Setup ---
+void autosteerSetup() {
+    // Setup autosteer
+}
+
+// --- Ethernet Start ---
+void EthernetStart() {
+    // Start Ethernet
+}
+
+// --- UDP NTRIP ---
+void udpNtrip() {
+    // Handle UDP NTRIP
+}
+
+// --- Build NMEA ---
+void BuildNmea() {
+    // Build NMEA messages
+}
+
+// --- Relative Position Decode ---
+void relPosDecode() {
+    // Decode relative position
+}
+
+// --- Read BNO ---
+void readBNO() {
+    // Read BNO085 data
+}
+
+// --- Autosteer Loop ---
+void autosteerLoop() {
+    // Autosteer loop
+}
+
+// --- Receive UDP ---
+void ReceiveUdp() {
+    // Receive UDP packets
+}
+
+// --- Update Kalman Filter Settings ---
+void updateKalmanFilterSettings() {
+    // Example: Adjust Kalman filter settings based on new data
+    // This is a placeholder for the self-learning mechanism
+    // You can implement machine learning algorithms here to update the settings
+    // based on the collected data and observed performance
+}
+
+// --- Check RTK Status ---
+void checkRTKStatus() {
+    if (/* RTK signal is lost */) {
+        if (rtkAvailable) {
+            rtkAvailable = false;
+            rtkLostTime = millis(); // Record the time RTK was lost
+        }
+    } else {
+        rtkAvailable = true; // RTK signal is back
+    }
+}
+
+// --- Handle Sensor Fallback ---
+void handleSensorFallback() {
+    if (!rtkAvailable && (millis() - rtkLostTime > maxRTKLossDuration)) {
+        // Switch to BNO085 as primary source
+        useBNO085ForAllData();
+    } else if (rtkAvailable) {
+        // Switch back to UM982 as primary source
+        useUM982ForAllData();
+    }
+}
+
+// --- Use BNO085 for All Data ---
+void useBNO085ForAllData() {
+    // Read heading, roll, and pitch from BNO085
+    heading = bno085Heading;
+    roll = bno085Roll; // If needed
+    pitch = bno085Pitch; // Optional
+    // Apply necessary filtering here
+}
+
+// --- Use UM982 for All Data ---
+void useUM982ForAllData() {
+    // Read heading and roll from UM982
+    heading = um982Heading;
+    roll = um982Roll;
+    // Optionally still use BNO085 for pitch or backup
+    pitch = bno085Pitch; 
+}
