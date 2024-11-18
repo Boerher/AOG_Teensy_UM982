@@ -1,0 +1,245 @@
+#include "zNMEAParser.h" // Library for parsing NMEA messages
+#include <SimpleKalmanFilter.h> // Kalman filter library for smoothing values
+#include <Ethernet.h> // Ethernet library for network communication
+#include <EthernetUdp.h> // UDP library for AgOpenGPS integration
+
+// --- User Configuration ---
+bool udpPassthrough = false; // Enable raw GPS data passthrough via UDP
+bool makeOGI = false;        // Generate PAOGI messages; false uses PNADA
+bool baseLineCheck = false;  // Enable IMU fusion if using dual antenna
+const bool invertRoll = true; // Invert roll for specific IMU setups
+#define BASELINE_LIMIT 5     // Baseline max deviation in cm
+const double headingCorrection = 0.0; // Correct heading offset (e.g., magnetic declination)
+const int GPS_BAUD_RATE = 460800; // UM982 communication baud rate
+const int OUTPUT_FREQUENCY_HZ = 10; // Desired output frequency
+
+// --- Serial Ports ---
+#define SERIAL_AGIO Serial // USB connection to AgIO
+#define SERIAL_RTK Serial3 // RTK correction input
+HardwareSerial* SERIAL_GPS = &Serial7; // Main GPS receiver
+
+// --- Kalman Filter Settings ---
+bool filterRoll = true; // Enable Kalman filtering for roll
+float rollMEA = 1.0;    // Measurement uncertainty for roll
+float rollEST = 1.0;    // Estimation uncertainty for roll
+float rollQ = 0.05;     // Process variance for roll
+
+bool filterHeading = true; // Enable Kalman filtering for heading
+float headingMEA = 1.0;    // Measurement uncertainty for heading
+float headingEST = 1.0;    // Estimation uncertainty for heading
+float headingQ = 0.02;     // Process variance for heading
+
+SimpleKalmanFilter rollFilter(rollMEA, rollEST, rollQ);
+SimpleKalmanFilter headingFilter(headingMEA, headingEST, headingQ);
+
+// --- Network Configuration ---
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED }; // MAC address
+IPAddress ip(192, 168, 1, 50);                      // Device IP address
+IPAddress agioIP(192, 168, 1, 100);                 // AgOpenGPS IP address
+unsigned int agioPort = 9999;                       // AgOpenGPS listening port
+EthernetUDP udp;
+
+// --- GPS State Variables ---
+bool dualReadyGGA = false; // Flag for valid GGA messages
+bool dualReadyRelPos = false; // Flag for valid relative position messages
+float roll = 0.0;          // Roll value
+float heading = 0.0;       // Heading value
+float pitch = 0.0;         // Pitch value
+double baseline = 0.0;     // Baseline length
+
+// --- LED Indicators ---
+#define LED_GPS_FIX 13
+#define LED_POWER_ON 5
+#define LED_GPS_READY 10
+
+// --- Function Prototypes ---
+void parseNMEA();
+void sendToAgOpenGPS();
+void initializeEthernet();
+void initializeLEDs();
+void calculateBaseline();
+void applyFilters();
+void setup();
+void loop();
+void errorHandler();
+void GGA_Handler();
+void VTG_Handler();
+void HDT_Handler();
+void HPR_Handler();
+void autosteerSetup();
+void EthernetStart();
+void udpNtrip();
+void BuildNmea();
+void relPosDecode();
+void autosteerLoop();
+void ReceiveUdp();
+void updateKalmanFilterSettings();
+
+// --- Setup Function ---
+void setup() {
+    delay(500); // Allow time for serial monitors
+
+    // Initialize serial ports
+    SERIAL_AGIO.begin(115200); // USB connection to AgIO
+    SERIAL_GPS->begin(GPS_BAUD_RATE);
+    SERIAL_RTK.begin(9600);
+
+    // Initialize Ethernet
+    initializeEthernet();
+
+    // Initialize LEDs
+    initializeLEDs();
+
+    // Confirm setup complete
+    SERIAL_AGIO.println("Setup complete, waiting for GPS data...");
+}
+
+// --- Main Loop ---
+void loop() {
+    // Parse incoming NMEA data
+    parseNMEA();
+
+    // Apply Kalman filtering to smooth roll and heading
+    applyFilters();
+
+    // Send data to AgOpenGPS
+    sendToAgOpenGPS();
+
+    // Update Kalman filter settings based on new data
+    updateKalmanFilterSettings();
+}
+
+// --- Parse NMEA Data ---
+void parseNMEA() {
+    while (SERIAL_GPS->available()) {
+        char incomingByte = SERIAL_GPS->read();
+        parser << incomingByte; // Feed data into the parser
+
+        if (parser.isValid()) {
+            String messageType = parser.messageType();
+            if (messageType == "GGA") {
+                dualReadyGGA = true; // Handle GGA message
+            } else if (messageType == "HDT") {
+                heading = parser.getHeading();
+                dualReadyRelPos = true;
+            } else if (messageType == "VTG") {
+                // Handle VTG message if needed
+            } else if (messageType == "HPR") {
+                heading = parser.getHeading();
+                pitch = parser.getPitch();
+                roll = parser.getRoll();
+                dualReadyRelPos = true;
+            }
+        }
+    }
+}
+
+// --- Apply Filters ---
+void applyFilters() {
+    if (filterRoll) {
+        roll = rollFilter.updateEstimate(roll);
+    }
+    if (filterHeading) {
+        heading = headingFilter.updateEstimate(heading + headingCorrection);
+    }
+}
+
+// --- Send Data to AgOpenGPS ---
+void sendToAgOpenGPS() {
+    if (dualReadyGGA && dualReadyRelPos) {
+        String message = "$PAOGI,"; // Replace with PNADA if needed
+        message += String(roll, 2) + ",";
+        message += String(pitch, 2) + ",";
+        message += String(heading, 2) + "\r\n";
+
+        udp.beginPacket(agioIP, agioPort);
+        udp.write(message.c_str());
+        udp.endPacket();
+
+        dualReadyGGA = false;
+        dualReadyRelPos = false;
+    }
+}
+
+// --- Initialize Ethernet ---
+void initializeEthernet() {
+    Ethernet.begin(mac, ip);
+    udp.begin(5544); // UDP port for PAOGI messages
+    SERIAL_AGIO.println("Ethernet initialized");
+}
+
+// --- Initialize LEDs ---
+void initializeLEDs() {
+    pinMode(LED_GPS_FIX, OUTPUT);
+    pinMode(LED_POWER_ON, OUTPUT);
+    pinMode(LED_GPS_READY, OUTPUT);
+    digitalWrite(LED_POWER_ON, HIGH); // Indicate power is on
+}
+
+// --- Error Handler ---
+void errorHandler() {
+    // Handle errors
+}
+
+// --- GGA Handler ---
+void GGA_Handler() {
+    // Handle GGA messages
+}
+
+// --- VTG Handler ---
+void VTG_Handler() {
+    // Handle VTG messages
+}
+
+// --- HDT Handler ---
+void HDT_Handler() {
+    // Handle HDT messages
+}
+
+// --- HPR Handler ---
+void HPR_Handler() {
+    // Handle HPR messages
+}
+
+// --- Autosteer Setup ---
+void autosteerSetup() {
+    // Setup autosteer
+}
+
+// --- Ethernet Start ---
+void EthernetStart() {
+    // Start Ethernet
+}
+
+// --- UDP NTRIP ---
+void udpNtrip() {
+    // Handle UDP NTRIP
+}
+
+// --- Build NMEA ---
+void BuildNmea() {
+    // Build NMEA messages
+}
+
+// --- Relative Position Decode ---
+void relPosDecode() {
+    // Decode relative position
+}
+
+// --- Autosteer Loop ---
+void autosteerLoop() {
+    // Autosteer loop
+}
+
+// --- Receive UDP ---
+void ReceiveUdp() {
+    // Receive UDP packets
+}
+
+// --- Update Kalman Filter Settings ---
+void updateKalmanFilterSettings() {
+    // Example: Adjust Kalman filter settings based on new data
+    // This is a placeholder for the self-learning mechanism
+    // You can implement machine learning algorithms here to update the settings
+    // based on the collected data and observed performance
+}
