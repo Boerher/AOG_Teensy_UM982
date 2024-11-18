@@ -201,6 +201,19 @@ void setup() {
     delay(10);
     Serial.println("Start setup");
 
+void GNHPR_Handler(NMEAParser::Message &msg) {
+    float heading = msg.getFloat(2);  // Heading is in the third field
+    float pitch = msg.getFloat(3);    // Pitch is in the fourth field
+    float roll = msg.getFloat(4);     // Roll is in the fifth field
+
+    Serial.print("Heading: ");
+    Serial.print(heading, 4);  // Print heading with 4 decimal places
+    Serial.print(" Pitch: ");
+    Serial.print(pitch, 4);    // Print pitch with 4 decimal places
+    Serial.print(" Roll: ");
+    Serial.println(roll, 4);   // Print roll with 4 decimal places
+}
+
     SerialGPS->begin(baudGPS);
     SerialGPS->addMemoryForRead(GPSrxbuffer, serial_buffer_size);
     SerialGPS->addMemoryForWrite(GPStxbuffer, serial_buffer_size);
