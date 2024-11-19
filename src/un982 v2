@@ -1,4 +1,17 @@
 /*
+ * Autosteer GPS for UM982 Chip with Dual Antennas
+ * Based on: Autosteer_gps_teensy_v4.ino (https://github.com/AgHardware/Boards/)
+ *
+ * This code is optimized for the UM982 chip with dual triple-band antennas.
+ * The code provides improved roll information and uses the UM982 as the primary
+ * source for heading, pitch, roll, and location data, with a BNO085 IMU as a backup.
+ */
+
+
+
+
+
+/*
  * This code is based on the original Autosteer_gps_teensy_v4.ino found at:
  * https://github.com/AgHardware/Boards/blob/main/TeensyModules/AIO%20Standard%20v4/Firmware/Autosteer_gps_teensy_v4/Autosteer_gps_teensy_v4.ino
  *
