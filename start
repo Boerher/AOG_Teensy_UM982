@@ -1,0 +1,42 @@
+/*
+  Copyright 2024 chriskinal
+  This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as
+  published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+  This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied 
+  warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+  You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
+  Forked from https://github.com/AgHardware/Boards/blob/main/TeensyModules/AIO%20Standard%20v4/Firmware/Autosteer_gps_teensy_v4/Autosteer_gps_teensy_v4.ino
+*/
+
+/*
+  UM982 Connection Instructions:
+  - The Teensy 4.1 communicates with the UM982 GPS receiver to gather precision data for AgOpenGPS. 
+  - UM982 provides heading, roll, and position data (latitude, longitude, and altitude).
+  - Teensy pin assignments for the UM982 connection:
+    * Teensy Serial 7 RX (Pin 28) -> UM982 TX1 (Sends position data from UM982 to Teensy).
+    * Teensy Serial 7 TX (Pin 29) -> UM982 RX1 (Receives RTCM correction data from Teensy for RTK functionality).
+
+  Additional Notes:
+  - Serial communication between the Teensy and UM982 is set to 460800 baud for efficient data transfer.
+  - The Teensy communicates with AgOpenGPS via USB or Ethernet, enabling real-time precision autosteer capabilities.
+*/
+
+/*
+  Informative Summary:
+  This program integrates the Teensy 4.1 microcontroller with the UM982 GPS receiver for high-accuracy GPS and IMU fusion.
+  Key features include:
+  - Real-time heading and roll data acquisition for autosteer.
+  - RTK corrections sent to the UM982 for centimeter-level accuracy.
+  - Compatibility with AgOpenGPS software through USB or Ethernet communication.
+  - Integration with the BNO08x IMU for enhanced orientation and stability data.
+  
+  Serial Ports:
+  - SerialAOG: Communicates with AgOpenGPS software over USB.
+  - SerialRTK: Communicates with an RTK radio for correction data.
+  - SerialGPS (Serial7): Handles data exchange with the UM982.
+
+  Hardware Setup:
+  - Ensure proper wiring between Teensy 4.1 and UM982 as per the connection plan.
+  - For IMU functionality, connect the BNO08x module via I2C (SCL: Pin 19, SDA: Pin 18).
+  - LEDs are used to indicate various system states such as GPS fix, IMU status, and Ethernet activity.
+*/
